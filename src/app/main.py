@@ -2,7 +2,7 @@
 Streamlit application for PDF-based Retrieval-Augmented Generation (RAG) 
 using HuggingFace + Gemini + LangChain.
 
-Fully DuckDB-based Chroma to avoid SQLite issues.
+Fully avoids SQLite; uses DuckDB+Parquet for Chroma.
 """
 
 import os
@@ -16,13 +16,13 @@ from typing import List, Any, Optional
 from datetime import datetime
 from dotenv import load_dotenv
 
-# Suppress torch warnings
+# ----------------- Suppress Warnings -----------------
 warnings.filterwarnings("ignore", category=UserWarning, message=".torch.classes.")
 
-# ----------------- CONFIG -----------------
-MAX_PDFS = 5  # Maximum PDFs to upload per chat
+# ----------------- Config -----------------
+MAX_PDFS = 5  # Maximum PDFs per chat
 
-# ----------------- Streamlit Config -----------------
+# 1️⃣ Streamlit page config
 st.set_page_config(
     page_title="📄 AI PDF Chat Assistant",
     page_icon="🤖",
@@ -30,13 +30,13 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ----------------- Load Environment -----------------
+# 2️⃣ Load .env
 load_dotenv()
 GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY") or os.getenv("GOOGLE_API_KEY")
 if not GOOGLE_API_KEY:
-    st.error("❌ GOOGLE_API_KEY not found! Set it in .env (local) or Streamlit Secrets (cloud).")
+    st.error("❌ GOOGLE_API_KEY not found! Set it in .env or Streamlit Secrets.")
 else:
-    st.sidebar.success("✅ GOOGLE_API_KEY loaded successfully")
+    st.sidebar.success("✅ GOOGLE_API_KEY loaded.")
 
 # ----------------- Imports for LangChain & HuggingFace -----------------
 from langchain_community.document_loaders import PyPDFLoader
@@ -48,7 +48,6 @@ from langchain_core.runnables import RunnablePassthrough
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.llms import HuggingFacePipeline
 from langchain_google_genai import ChatGoogleGenerativeAI
-from chromadb.config import Settings
 from transformers import pipeline, BitsAndBytesConfig
 import torch
 
@@ -62,7 +61,7 @@ logger = logging.getLogger(__name__)
 
 # ----------------- Utility Functions -----------------
 def create_vector_db(file_uploads: List[Any]) -> Chroma:
-    """Create vector DB using HuggingFace embeddings and DuckDB+Parquet only."""
+    """Create Chroma vector DB using DuckDB+Parquet (avoids SQLite)."""
     all_chunks = []
 
     for file_upload in file_uploads:
@@ -91,32 +90,27 @@ def create_vector_db(file_uploads: List[Any]) -> Chroma:
         model_kwargs={"device": "cpu"}
     )
 
-    # Force DuckDB+Parquet, in-memory (avoids SQLite)
-    settings = Settings(
-        chroma_db_impl="duckdb+parquet",
-        persist_directory=None,
-        anonymized_telemetry=False
-    )
+    persist_dir = tempfile.mkdtemp()
 
     vector_db = Chroma.from_documents(
         documents=all_chunks,
         embedding=embeddings,
+        persist_directory=persist_dir,
         collection_name=f"pdf_collection_{datetime.now().timestamp()}",
-        client_settings=settings
+        client_settings={"chroma_db_impl": "duckdb+parquet"}  # force DuckDB
     )
     return vector_db
 
 
 @st.cache_resource
 def get_hf_pipeline(model_name: str):
-    """Return a HuggingFacePipeline wrapped for LangChain with optional quantization."""
+    """Return HuggingFace pipeline LLM."""
     quantization_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_compute_dtype=torch.float16,
         bnb_4bit_quant_type="nf4",
         bnb_4bit_use_double_quant=True,
     )
-
     device = 0 if torch.cuda.is_available() else -1
     task = "text2text-generation" if "t5" in model_name.lower() or "bart" in model_name.lower() else "text-generation"
 
@@ -134,9 +128,9 @@ def get_hf_pipeline(model_name: str):
 
 @st.cache_resource
 def get_gemini_llm(model_name: str = "gemini-1.5-pro"):
-    """Return a Gemini LLM wrapped for LangChain"""
+    """Return Gemini LLM."""
     if not GOOGLE_API_KEY:
-        raise ValueError("❌ GOOGLE_API_KEY not found in environment variables")
+        raise ValueError("❌ GOOGLE_API_KEY not found.")
     return ChatGoogleGenerativeAI(
         model=model_name,
         temperature=0.2,
@@ -147,7 +141,7 @@ def get_gemini_llm(model_name: str = "gemini-1.5-pro"):
 
 
 def process_question(question: str, vector_db: Optional[Chroma], llm) -> str:
-    """Process user question with RAG pipeline, strictly PDF-only."""
+    """Process user question with RAG."""
     if vector_db is None:
         return "🤔 No documents uploaded for this chat."
 
@@ -166,7 +160,6 @@ If the answer is not in the context, say clearly:
 ----------------
 Question: {question}
 """
-
     prompt = ChatPromptTemplate.from_template(template)
     chain = (
         {"context": lambda _: context_texts, "question": RunnablePassthrough()}
@@ -208,7 +201,7 @@ def delete_chat_data(chat_id: str) -> None:
     st.session_state["chats"].pop(chat_id, None)
 
 
-# ----------------- Main Application -----------------
+# ----------------- Main App -----------------
 def main() -> None:
     st.markdown("# 📄 AI PDF Chat Assistant")
     st.markdown("#### Your intelligent assistant for document understanding.")
@@ -224,25 +217,24 @@ def main() -> None:
     if "llm" not in st.session_state:
         st.session_state["llm"] = None
 
-    # ---------------- Sidebar Chat History ----------------
+    # ---------------- Sidebar ----------------
     st.sidebar.subheader("💬 Chats")
     if st.sidebar.button("➕ New Chat"):
         chat_id = "Chat - " + datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         st.session_state["chats"][chat_id] = {"messages": [], "vector_db": None, "file_uploads": [], "pdf_pages": []}
         st.session_state["active_chat"] = chat_id
 
-    if st.session_state["chats"]:
-        for chat_id in list(st.session_state["chats"].keys())[::-1]:
-            col_a, col_b = st.sidebar.columns([8, 1])
-            if col_a.button(chat_id, key=f"open_{chat_id}"):
-                st.session_state["active_chat"] = chat_id
-            if col_b.button("🗑️", key=f"del_{chat_id}"):
-                delete_chat_data(chat_id)
-                if st.session_state.get("active_chat") == chat_id:
-                    st.session_state["active_chat"] = None
-                break
+    for chat_id in list(st.session_state["chats"].keys())[::-1]:
+        col_a, col_b = st.sidebar.columns([8, 1])
+        if col_a.button(chat_id, key=f"open_{chat_id}"):
+            st.session_state["active_chat"] = chat_id
+        if col_b.button("🗑️", key=f"del_{chat_id}"):
+            delete_chat_data(chat_id)
+            if st.session_state.get("active_chat") == chat_id:
+                st.session_state["active_chat"] = None
+            break
 
-    # ---------------- Left: PDF Upload ----------------
+    # ---------------- Left Column ----------------
     with col1:
         st.subheader("📂 Documents & Collections")
         active = st.session_state.get("active_chat")
@@ -287,7 +279,7 @@ def main() -> None:
             except Exception as e:
                 st.error(f"Failed: {e}")
 
-    # ---------------- Right: Chat ----------------
+    # ---------------- Right Column ----------------
     with col2:
         st.sidebar.markdown("---")
         st.sidebar.subheader("🧠 Model")
