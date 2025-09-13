@@ -98,6 +98,7 @@ def create_vector_db(file_uploads: List[Any]) -> Chroma:
         embedding=embeddings,
         persist_directory=None,
         collection_name=f"pdf_collection_{datetime.now().timestamp()}",
+        client_settings={"chroma_db_impl": "duckdb+parquet"}
     )
     return vector_db
 
