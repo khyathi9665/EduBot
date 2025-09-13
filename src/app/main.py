@@ -33,6 +33,14 @@ import torch
 from langchain_google_genai import ChatGoogleGenerativeAI
 from dotenv import load_dotenv
 
+load_dotenv()
+
+# Streamlit Cloud: use st.secrets, fallback to .env
+GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY") or os.getenv("GOOGLE_API_KEY")
+
+if not GOOGLE_API_KEY:
+    st.error("❌ GOOGLE_API_KEY not found! Set it in .env (local) or Streamlit Secrets (cloud).")
+
 # ----------------- CONFIG -----------------
 PERSIST_DIRECTORY = os.path.join("data", "vectors")
 MAX_PDFS = 5  # Maximum PDFs to upload per chat
@@ -157,15 +165,14 @@ def get_hf_pipeline(model_name: str):
 @st.cache_resource
 def get_gemini_llm(model_name: str = "gemini-1.5-pro"):
     """Return a Gemini LLM wrapped for LangChain"""
-    api_key = os.getenv("GOOGLE_API_KEY")
-    if not api_key:
+    if not GOOGLE_API_KEY:
         raise ValueError("❌ GOOGLE_API_KEY not found in environment variables")
 
     return ChatGoogleGenerativeAI(
         model=model_name,
         temperature=0.2,
         max_output_tokens=512,
-        google_api_key=api_key,
+        google_api_key=GOOGLE_API_KEY,
         credentials=None
     )
 
