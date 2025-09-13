@@ -1,4 +1,5 @@
 streamlit==1.40.0
+rich<14,>=10.14.0
 pdfplumber==0.11.4
 langchain==0.3.14
 langchain-core==0.3.29
@@ -10,7 +11,6 @@ unstructured[all-docs]>=0.16.12
 onnx>=1.17.0
 protobuf==5.29.2
 chromadb>=0.4.22
-duckdb>=1.9.0
 Pillow==10.4.0
 numpy==1.26.4
 pydantic==2.10.4
