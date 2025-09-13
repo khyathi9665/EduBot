@@ -2,14 +2,8 @@
 Streamlit application for PDF-based Retrieval-Augmented Generation (RAG) 
 using HuggingFace + Gemini + LangChain.
 
-Fully avoids SQLite; uses DuckDB+Parquet for Chroma.
+✅ Fully avoids SQLite/Chroma by using FAISS vector store.
 """
-try:
-    __import__("pysqlite3")
-    import sys
-    sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
-except ImportError:
-    pass
 
 import os
 import streamlit as st
@@ -23,7 +17,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 
 # ----------------- Suppress Warnings -----------------
-warnings.filterwarnings("ignore", category=UserWarning, message=".torch.classes.")
+warnings.filterwarnings("ignore", category=UserWarning)
 
 # ----------------- Config -----------------
 MAX_PDFS = 5  # Maximum PDFs per chat
@@ -45,15 +39,14 @@ else:
     st.sidebar.success("✅ GOOGLE_API_KEY loaded.")
 
 # ----------------- Imports for LangChain & HuggingFace -----------------
-from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import Chroma
 from langchain.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.llms import HuggingFacePipeline
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_community.vectorstores import FAISS
 from transformers import pipeline, BitsAndBytesConfig
 import torch
 
@@ -66,8 +59,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ----------------- Utility Functions -----------------
-def create_vector_db(file_uploads: List[Any]) -> Chroma:
-    """Create Chroma vector DB using DuckDB+Parquet (avoids SQLite)."""
+def create_vector_db(file_uploads: List[Any]) -> FAISS:
+    """Create FAISS vector store from uploaded PDFs."""
     all_chunks = []
 
     for file_upload in file_uploads:
@@ -76,18 +69,15 @@ def create_vector_db(file_uploads: List[Any]) -> Chroma:
         with open(path, "wb") as f:
             f.write(file_upload.getvalue())
 
-        loader = PyPDFLoader(path)
-        docs = loader.load()
-        for i, doc in enumerate(docs):
-            doc.metadata["source"] = file_upload.name
-            doc.metadata["page"] = i + 1
-
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=2500, chunk_overlap=200)
-        for doc in docs:
-            chunks = text_splitter.split_documents([doc])
-            for chunk in chunks:
-                chunk.metadata = doc.metadata.copy()
-                all_chunks.append(chunk)
+        with pdfplumber.open(path) as pdf:
+            for i, page in enumerate(pdf.pages):
+                text = page.extract_text()
+                if not text:
+                    continue
+                doc = {"page_content": text, "metadata": {"source": file_upload.name, "page": i + 1}}
+                splitter = RecursiveCharacterTextSplitter(chunk_size=2500, chunk_overlap=200)
+                chunks = splitter.create_documents([doc])
+                all_chunks.extend(chunks)
 
         shutil.rmtree(temp_dir)
 
@@ -96,14 +86,7 @@ def create_vector_db(file_uploads: List[Any]) -> Chroma:
         model_kwargs={"device": "cpu"}
     )
 
-
-    vector_db = Chroma.from_documents(
-        documents=all_chunks,
-        embedding=embeddings,
-        persist_directory=None,
-        collection_name=f"pdf_collection_{datetime.now().timestamp()}",
-        client_settings={"chroma_db_impl": "duckdb+parquet"}  # force DuckDB
-    )
+    vector_db = FAISS.from_documents(all_chunks, embeddings)
     return vector_db
 
 
@@ -145,7 +128,7 @@ def get_gemini_llm(model_name: str = "gemini-1.5-pro"):
     )
 
 
-def process_question(question: str, vector_db: Optional[Chroma], llm) -> str:
+def process_question(question: str, vector_db: Optional[FAISS], llm) -> str:
     """Process user question with RAG."""
     if vector_db is None:
         return "🤔 No documents uploaded for this chat."
@@ -179,33 +162,6 @@ Question: {question}
         return f"⚠️ Error: {e}"
 
 
-@st.cache_data
-def extract_all_pages_as_images(file_uploads: List[Any]) -> List[Any]:
-    pdf_pages = []
-    for file_upload in file_uploads:
-        with pdfplumber.open(file_upload) as pdf:
-            for i, page in enumerate(pdf.pages):
-                pdf_pages.append({
-                    "image": page.to_image().original,
-                    "source": file_upload.name,
-                    "page": i + 1
-                })
-    return pdf_pages
-
-
-def delete_chat_data(chat_id: str) -> None:
-    chat = st.session_state["chats"].get(chat_id)
-    if not chat:
-        return
-    try:
-        db = chat.get("vector_db")
-        if db and hasattr(db, "_client"):
-            db._client.reset()
-    except Exception:
-        pass
-    st.session_state["chats"].pop(chat_id, None)
-
-
 # ----------------- Main App -----------------
 def main() -> None:
     st.markdown("# 📄 AI PDF Chat Assistant")
@@ -226,15 +182,15 @@ def main() -> None:
     st.sidebar.subheader("💬 Chats")
     if st.sidebar.button("➕ New Chat"):
         chat_id = "Chat - " + datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        st.session_state["chats"][chat_id] = {"messages": [], "vector_db": None, "file_uploads": [], "pdf_pages": []}
+        st.session_state["chats"][chat_id] = {"messages": [], "vector_db": None}
         st.session_state["active_chat"] = chat_id
 
     for chat_id in list(st.session_state["chats"].keys())[::-1]:
         col_a, col_b = st.sidebar.columns([8, 1])
-        if col_a.button(chat_id, key=f"open_{chat_id}"):
+        if col_a.button(chat_id, key=f"open_{chat_id}") and chat_id in st.session_state["chats"]:
             st.session_state["active_chat"] = chat_id
         if col_b.button("🗑️", key=f"del_{chat_id}"):
-            delete_chat_data(chat_id)
+            st.session_state["chats"].pop(chat_id, None)
             if st.session_state.get("active_chat") == chat_id:
                 st.session_state["active_chat"] = None
             break
@@ -260,29 +216,14 @@ def main() -> None:
                 try:
                     vector_db = create_vector_db(file_uploads)
                     st.session_state["chats"][active]["vector_db"] = vector_db
-                    st.session_state["chats"][active]["pdf_pages"] = extract_all_pages_as_images(file_uploads)
                     st.success("✅ PDFs processed.")
                 except Exception as e:
                     st.error(f"Error: {e}")
 
-        if active and st.session_state["chats"][active].get("pdf_pages"):
-            with st.expander("📑 View PDFs"):
-                zoom = st.slider("Zoom", 100, 1000, 700, 50, key=f"zoom_{active}")
-                for page_info in st.session_state["chats"][active]["pdf_pages"]:
-                    st.image(page_info["image"], width=zoom)
-                    st.caption(f'{page_info["source"]} - Page {page_info["page"]}')
-
         if active and st.button("⚠️ Clear PDFs for this chat"):
-            try:
-                db = st.session_state["chats"][active].get("vector_db")
-                if db and hasattr(db, "_client"):
-                    db._client.reset()
-                st.session_state["chats"][active]["vector_db"] = None
-                st.session_state["chats"][active]["pdf_pages"] = []
-                st.session_state["chats"][active]["file_uploads"] = []
-                st.success("Cleared.")
-            except Exception as e:
-                st.error(f"Failed: {e}")
+            st.session_state["chats"][active]["vector_db"] = None
+            st.session_state["chats"][active]["file_uploads"] = []
+            st.success("Cleared.")
 
     # ---------------- Right Column ----------------
     with col2:
