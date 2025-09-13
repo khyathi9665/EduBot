@@ -1,8 +1,8 @@
 """
-Streamlit application for PDF-based Retrieval-Augmented Generation (RAG) using Ollama + LangChain.
+Streamlit application for PDF-based Retrieval-Augmented Generation (RAG) 
+using HuggingFace + Gemini + LangChain.
 
-This application allows users to upload a PDF, process it,
-and then ask questions about the content using a selected language model.
+Adaptive professional UI (light/dark) with glassmorphism, premium SaaS feel.
 """
 
 import streamlit as st
@@ -11,370 +11,383 @@ import os
 import tempfile
 import shutil
 import pdfplumber
-import ollama
 import warnings
+from typing import List, Any, Optional
+from datetime import datetime
 
-# Suppress torch warning
-warnings.filterwarnings('ignore', category=UserWarning, message='.*torch.classes.*')
+# Suppress torch warnings
+warnings.filterwarnings("ignore", category=UserWarning, message=".torch.classes.")
 
-from langchain_community.document_loaders import UnstructuredPDFLoader
-from langchain_ollama import OllamaEmbeddings
+from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
-from langchain.prompts import ChatPromptTemplate, PromptTemplate
+from langchain.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from langchain_ollama import ChatOllama
 from langchain_core.runnables import RunnablePassthrough
-from langchain.retrievers.multi_query import MultiQueryRetriever
-from typing import List, Tuple, Dict, Any, Optional
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.llms import HuggingFacePipeline
+from transformers import pipeline, BitsAndBytesConfig
+import torch
 
-# Set protobuf environment variable to avoid error messages
-# This might cause some issues with latency but it's a tradeoff
-os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
+# Gemini
+from langchain_google_genai import ChatGoogleGenerativeAI
+from dotenv import load_dotenv
 
-# Define persistent directory for ChromaDB
+# ----------------- CONFIG -----------------
 PERSIST_DIRECTORY = os.path.join("data", "vectors")
+MAX_PDFS = 5  # Maximum PDFs to upload per chat
 
-# Streamlit page configuration
 st.set_page_config(
-    page_title="Ollama PDF RAG Streamlit UI",
-    page_icon="🎈",
+    page_title="📄 AI PDF Chat Assistant",
+    page_icon="🤖",
     layout="wide",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="expanded",
 )
 
-# Logging configuration
+# Load .env file
+load_dotenv()
+
+# ✅ Debug check for API key
+if not os.getenv("GOOGLE_API_KEY"):
+    st.error("❌ GOOGLE_API_KEY not found in .env file!")
+else:
+    st.sidebar.success("✅ GOOGLE_API_KEY loaded from .env")
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-
 logger = logging.getLogger(__name__)
 
+# ----------------- Dark/Light Theme Toggle -----------------
+theme = st.sidebar.radio("🌗 Theme", ["Light", "Dark"], index=0)
 
-def extract_model_names(models_info: Any) -> Tuple[str, ...]:
-    """
-    Extract model names from the provided models information.
-
-    Args:
-        models_info: Response from ollama.list()
-
-    Returns:
-        Tuple[str, ...]: A tuple of model names.
-    """
-    logger.info("Extracting model names from models_info")
-    try:
-        # The new response format returns a list of Model objects
-        if hasattr(models_info, "models"):
-            # Extract model names from the Model objects
-            model_names = tuple(model.model for model in models_info.models)
-        else:
-            # Fallback for any other format
-            model_names = tuple()
-            
-        logger.info(f"Extracted model names: {model_names}")
-        return model_names
-    except Exception as e:
-        logger.error(f"Error extracting model names: {e}")
-        return tuple()
-
-
-def create_vector_db(file_upload) -> Chroma:
-    """
-    Create a vector database from an uploaded PDF file.
-
-    Args:
-        file_upload (st.UploadedFile): Streamlit file upload object containing the PDF.
-
-    Returns:
-        Chroma: A vector store containing the processed document chunks.
-    """
-    logger.info(f"Creating vector DB from file upload: {file_upload.name}")
-    temp_dir = tempfile.mkdtemp()
-
-    path = os.path.join(temp_dir, file_upload.name)
-    with open(path, "wb") as f:
-        f.write(file_upload.getvalue())
-        logger.info(f"File saved to temporary path: {path}")
-        loader = UnstructuredPDFLoader(path)
-        data = loader.load()
-
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=7500, chunk_overlap=100)
-    chunks = text_splitter.split_documents(data)
-    logger.info("Document split into chunks")
-
-    # Updated embeddings configuration with persistent storage
-    embeddings = OllamaEmbeddings(model="nomic-embed-text")
-    vector_db = Chroma.from_documents(
-        documents=chunks,
-        embedding=embeddings,
-        persist_directory=PERSIST_DIRECTORY,
-        collection_name=f"pdf_{hash(file_upload.name)}"  # Unique collection name per file
+if theme == "Dark":
+    st.markdown(
+        """
+        <style>
+        body, .stApp { background-color: #0E1117; color: #FAFAFA; }
+        .stButton>button, .stSelectbox, .stFileUploader, .stTextInput, .stSlider {
+            background-color: #262730; color: #FAFAFA; border-radius: 10px;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True
     )
-    logger.info("Vector DB created with persistent storage")
+else:
+    st.markdown(
+        """
+        <style>
+        body, .stApp { background-color: #FFFFFF; color: #000000; }
+        .stButton>button, .stSelectbox, .stFileUploader, .stTextInput, .stSlider {
+            background-color: #F0F2F6; color: #000000; border-radius: 10px;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
 
-    shutil.rmtree(temp_dir)
-    logger.info(f"Temporary directory {temp_dir} removed")
+# ----------------- Utility Functions -----------------
+def create_vector_db(file_uploads: List[Any]) -> Chroma:
+    """Create vector database with HuggingFace embeddings (384-dim)."""
+    all_chunks = []
+    for file_upload in file_uploads:
+        temp_dir = tempfile.mkdtemp()
+        path = os.path.join(temp_dir, file_upload.name)
+        with open(path, "wb") as f:
+            f.write(file_upload.getvalue())
+
+        loader = PyPDFLoader(path)
+        docs = loader.load()
+
+        # Track metadata
+        for i, doc in enumerate(docs):
+            doc.metadata["source"] = file_upload.name
+            doc.metadata["page"] = i + 1
+
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=2500, chunk_overlap=200)
+        for doc in docs:
+            chunks = text_splitter.split_documents([doc])
+            for chunk in chunks:
+                chunk.metadata = doc.metadata.copy()
+                all_chunks.append(chunk)
+
+        shutil.rmtree(temp_dir)
+
+    embeddings = HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2",
+        model_kwargs={"device": "cpu"}
+    )
+
+    vector_db = Chroma.from_documents(
+        documents=all_chunks,
+        embedding=embeddings,
+        persist_directory=None,
+        collection_name=f"pdf_collection_{datetime.now().timestamp()}",
+    )
     return vector_db
 
 
-def process_question(question: str, vector_db: Chroma, selected_model: str) -> str:
-    """
-    Process a user question using the vector database and selected language model.
-
-    Args:
-        question (str): The user's question.
-        vector_db (Chroma): The vector database containing document embeddings.
-        selected_model (str): The name of the selected language model.
-
-    Returns:
-        str: The generated response to the user's question.
-    """
-    logger.info(f"Processing question: {question} using model: {selected_model}")
-    
-    # Initialize LLM
-    llm = ChatOllama(model=selected_model)
-    
-    # Query prompt template
-    QUERY_PROMPT = PromptTemplate(
-        input_variables=["question"],
-        template="""You are an AI language model assistant. Your task is to generate 2
-        different versions of the given user question to retrieve relevant documents from
-        a vector database. By generating multiple perspectives on the user question, your
-        goal is to help the user overcome some of the limitations of the distance-based
-        similarity search. Provide these alternative questions separated by newlines.
-        Original question: {question}""",
+@st.cache_resource
+def get_hf_pipeline(model_name: str):
+    """Return a HuggingFacePipeline wrapped for LangChain with optional quantization."""
+    quantization_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
     )
 
-    # Set up retriever
-    retriever = MultiQueryRetriever.from_llm(
-        vector_db.as_retriever(), 
-        llm,
-        prompt=QUERY_PROMPT
+    device = 0 if torch.cuda.is_available() else -1
+    task = "text2text-generation" if "t5" in model_name.lower() or "bart" in model_name.lower() else "text-generation"
+
+    pipe = pipeline(
+        task,
+        model=model_name,
+        tokenizer=model_name,
+        max_new_tokens=512,
+        device=device,
+        trust_remote_code=True,
+        quantization_config=quantization_config if device != -1 else None,
+    )
+    return HuggingFacePipeline(pipeline=pipe)
+
+
+@st.cache_resource
+def get_gemini_llm(model_name: str = "gemini-1.5-pro"):
+    """Return a Gemini LLM wrapped for LangChain"""
+    api_key = os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        raise ValueError("❌ GOOGLE_API_KEY not found in environment variables")
+
+    return ChatGoogleGenerativeAI(
+        model=model_name,
+        temperature=0.2,
+        max_output_tokens=512,
+        google_api_key=api_key,
+        credentials=None
     )
 
-    # RAG prompt template
-    template = """Answer the question based ONLY on the following context:
-    {context}
-    Question: {question}
-    """
+
+def process_question(question: str, vector_db: Optional[Chroma], llm) -> str:
+    """Process user question with RAG pipeline, strictly PDF-only."""
+    if vector_db is None:
+        return "🤔 No documents uploaded for this chat."
+
+    results = vector_db.similarity_search_with_score(question, k=3)
+
+    # ✅ Strict check: if no context or weak matches, refuse
+    if not results or all(not doc.page_content.strip() for doc, _ in results):
+        return "I don’t know, it is not mentioned in the uploaded PDFs."
+
+    context_texts = "\n\n".join([doc.page_content for doc, _ in results])
+
+    template = """
+Answer the question based ONLY on the following context.
+If the answer is not in the context, say clearly: 
+"I don’t know, it is not mentioned in the uploaded PDFs."
+----------------
+{context}
+----------------
+Question: {question}
+"""
 
     prompt = ChatPromptTemplate.from_template(template)
 
-    # Create chain
     chain = (
-        {"context": retriever, "question": RunnablePassthrough()}
+        {"context": lambda _: context_texts, "question": RunnablePassthrough()}
         | prompt
         | llm
         | StrOutputParser()
     )
 
-    response = chain.invoke(question)
-    logger.info("Question processed and response generated")
-    return response
+    try:
+        return chain.invoke(question).strip()
+    except Exception as e:
+        return f"⚠️ Error: {e}"
 
 
 @st.cache_data
-def extract_all_pages_as_images(file_upload) -> List[Any]:
-    """
-    Extract all pages from a PDF file as images.
-
-    Args:
-        file_upload (st.UploadedFile): Streamlit file upload object containing the PDF.
-
-    Returns:
-        List[Any]: A list of image objects representing each page of the PDF.
-    """
-    logger.info(f"Extracting all pages as images from file: {file_upload.name}")
+def extract_all_pages_as_images(file_uploads: List[Any]) -> List[Any]:
+    """Return list of dicts {image, source, page} for preview."""
     pdf_pages = []
-    with pdfplumber.open(file_upload) as pdf:
-        pdf_pages = [page.to_image().original for page in pdf.pages]
-    logger.info("PDF pages extracted as images")
+    for file_upload in file_uploads:
+        with pdfplumber.open(file_upload) as pdf:
+            for i, page in enumerate(pdf.pages):
+                pdf_pages.append({
+                    "image": page.to_image().original,
+                    "source": file_upload.name,
+                    "page": i + 1
+                })
     return pdf_pages
 
 
-def delete_vector_db(vector_db: Optional[Chroma]) -> None:
-    """
-    Delete the vector database and clear related session state.
-
-    Args:
-        vector_db (Optional[Chroma]): The vector database to be deleted.
-    """
-    logger.info("Deleting vector DB")
-    if vector_db is not None:
-        try:
-            # Delete the collection
-            vector_db.delete_collection()
-            
-            # Clear session state
-            st.session_state.pop("pdf_pages", None)
-            st.session_state.pop("file_upload", None)
-            st.session_state.pop("vector_db", None)
-            
-            st.success("Collection and temporary files deleted successfully.")
-            logger.info("Vector DB and related session state cleared")
-            st.rerun()
-        except Exception as e:
-            st.error(f"Error deleting collection: {str(e)}")
-            logger.error(f"Error deleting collection: {e}")
-    else:
-        st.error("No vector database found to delete.")
-        logger.warning("Attempted to delete vector DB, but none was found")
+def delete_chat_data(chat_id: str) -> None:
+    """Delete a single chat's persisted artifacts (if any) from memory."""
+    chat = st.session_state["chats"].get(chat_id)
+    if not chat:
+        return
+    try:
+        db = chat.get("vector_db")
+        if db is not None and hasattr(db, "_client"):
+            db._client.reset()
+    except Exception:
+        pass
+    st.session_state["chats"].pop(chat_id, None)
 
 
+# ----------------- Main Application -----------------
 def main() -> None:
-    """
-    Main function to run the Streamlit application.
-    """
-    st.subheader("🧠 Ollama PDF RAG playground", divider="gray", anchor=False)
+    st.markdown("# 📄 AI PDF Chat Assistant")
+    st.markdown("#### Your intelligent assistant for document understanding.")
 
-    # Get available models
-    models_info = ollama.list()
-    available_models = extract_model_names(models_info)
-
-    # Create layout
     col1, col2 = st.columns([1.5, 2])
 
-    # Initialize session state
-    if "messages" not in st.session_state:
-        st.session_state["messages"] = []
-    if "vector_db" not in st.session_state:
-        st.session_state["vector_db"] = None
-    if "use_sample" not in st.session_state:
-        st.session_state["use_sample"] = False
+    # Initialize session state containers
+    if "chats" not in st.session_state:
+        st.session_state["chats"] = {}
+    if "active_chat" not in st.session_state:
+        st.session_state["active_chat"] = None
+    if "selected_model" not in st.session_state:
+        st.session_state["selected_model"] = None
+    if "llm" not in st.session_state:
+        st.session_state["llm"] = None
 
-    # Model selection
-    if available_models:
-        selected_model = col2.selectbox(
-            "Pick a model available locally on your system ↓", 
-            available_models,
-            key="model_select"
-        )
+    # Sidebar Chat History
+    st.sidebar.subheader("💬 Chats")
+    if st.sidebar.button("➕ New Chat"):
+        chat_id = "Chat - " + datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        st.session_state["chats"][chat_id] = {
+            "messages": [], "vector_db": None, "file_uploads": [], "pdf_pages": []
+        }
+        st.session_state["active_chat"] = chat_id
 
-    # Add checkbox for sample PDF
-    use_sample = col1.toggle(
-        "Use sample PDF (Scammer Agent Paper)", 
-        key="sample_checkbox"
-    )
-    
-    # Clear vector DB if switching between sample and upload
-    if use_sample != st.session_state.get("use_sample"):
-        if st.session_state["vector_db"] is not None:
-            st.session_state["vector_db"].delete_collection()
-            st.session_state["vector_db"] = None
-            st.session_state["pdf_pages"] = None
-        st.session_state["use_sample"] = use_sample
+    if st.session_state["chats"]:
+        for chat_id in list(st.session_state["chats"].keys())[::-1]:
+            col_a, col_b = st.sidebar.columns([8,1])
+            if col_a.button(chat_id, key=f"open_{chat_id}"):
+                st.session_state["active_chat"] = chat_id
+            if col_b.button("🗑️", key=f"del_{chat_id}"):
+                delete_chat_data(chat_id)
+                if st.session_state.get("active_chat") == chat_id:
+                    st.session_state["active_chat"] = None
+                break
 
-    if use_sample:
-        # Use the sample PDF
-        sample_path = "data/pdfs/sample/scammer-agent.pdf"
-        if os.path.exists(sample_path):
-            if st.session_state["vector_db"] is None:
-                with st.spinner("Processing sample PDF..."):
-                    loader = UnstructuredPDFLoader(file_path=sample_path)
-                    data = loader.load()
-                    text_splitter = RecursiveCharacterTextSplitter(chunk_size=7500, chunk_overlap=100)
-                    chunks = text_splitter.split_documents(data)
-                    st.session_state["vector_db"] = Chroma.from_documents(
-                        documents=chunks,
-                        embedding=OllamaEmbeddings(model="nomic-embed-text"),
-                        persist_directory=PERSIST_DIRECTORY,
-                        collection_name="sample_pdf"
-                    )
-                    # Open and display the sample PDF
-                    with pdfplumber.open(sample_path) as pdf:
-                        st.session_state["pdf_pages"] = [page.to_image().original for page in pdf.pages]
+    # Left: PDF upload
+    with col1:
+        st.subheader("📂 Documents & Collections")
+        active = st.session_state.get("active_chat")
+        if active is None:
+            st.info("Start a new chat (sidebar) or select an existing chat.")
         else:
-            st.error("Sample PDF file not found in the current directory.")
-    else:
-        # Regular file upload with unique key
-        file_upload = col1.file_uploader(
-            "Upload a PDF file ↓", 
-            type="pdf", 
-            accept_multiple_files=False,
-            key="pdf_uploader"
+            st.markdown(f"**Active chat:** {active}")
+
+        file_uploads = st.file_uploader(
+            f"Upload PDF files (max {MAX_PDFS})",
+            type="pdf",
+            accept_multiple_files=True,
+            key=f"uploader_{active}"
         )
 
-        if file_upload:
-            if st.session_state["vector_db"] is None:
-                with st.spinner("Processing uploaded PDF..."):
-                    st.session_state["vector_db"] = create_vector_db(file_upload)
-                    # Store the uploaded file in session state
-                    st.session_state["file_upload"] = file_upload
-                    # Extract and store PDF pages
-                    with pdfplumber.open(file_upload) as pdf:
-                        st.session_state["pdf_pages"] = [page.to_image().original for page in pdf.pages]
+        if file_uploads and active:
+            if len(file_uploads) > MAX_PDFS:
+                st.warning(f"Max {MAX_PDFS} PDFs allowed. Extras ignored.")
+                file_uploads = file_uploads[:MAX_PDFS]
 
-    # Display PDF if pages are available
-    if "pdf_pages" in st.session_state and st.session_state["pdf_pages"]:
-        # PDF display controls
-        zoom_level = col1.slider(
-            "Zoom Level", 
-            min_value=100, 
-            max_value=1000, 
-            value=700, 
-            step=50,
-            key="zoom_slider"
-        )
+            st.session_state["chats"][active]["file_uploads"] = file_uploads
+            with st.spinner("Processing PDFs..."):
+                try:
+                    vector_db = create_vector_db(file_uploads)
+                    st.session_state["chats"][active]["vector_db"] = vector_db
+                    st.session_state["chats"][active]["pdf_pages"] = extract_all_pages_as_images(file_uploads)
+                    st.success("✅ PDFs processed.")
+                except Exception as e:
+                    st.error(f"Error: {e}")
 
-        # Display PDF pages
-        with col1:
-            with st.container(height=410, border=True):
-                for page_image in st.session_state["pdf_pages"]:
-                    st.image(page_image, width=zoom_level)
+        if active and st.session_state["chats"][active].get("pdf_pages"):
+            with st.expander("📑 View PDFs"):
+                zoom = st.slider("Zoom", 100, 1000, 700, 50, key=f"zoom_{active}")
+                for page_info in st.session_state["chats"][active]["pdf_pages"]:
+                    st.image(page_info["image"], width=zoom)
+                    st.caption(f'{page_info["source"]} - Page {page_info["page"]}')
 
-    # Delete collection button
-    delete_collection = col1.button(
-        "⚠️ Delete collection", 
-        type="secondary",
-        key="delete_button"
-    )
+        if active and st.button("⚠️ Clear PDFs for this chat"):
+            try:
+                db = st.session_state["chats"][active].get("vector_db")
+                if db and hasattr(db, "_client"):
+                    db._client.reset()
+                st.session_state["chats"][active]["vector_db"] = None
+                st.session_state["chats"][active]["pdf_pages"] = []
+                st.session_state["chats"][active]["file_uploads"] = []
+                st.success("Cleared.")
+            except Exception as e:
+                st.error(f"Failed: {e}")
 
-    if delete_collection:
-        delete_vector_db(st.session_state["vector_db"])
-
-    # Chat interface
+    # Right: Chat
     with col2:
-        message_container = st.container(height=500, border=True)
+        st.sidebar.markdown("---")
+        st.sidebar.subheader("🧠 Model")
+        available_models = [
+            "gemini-1.5-pro",
+            "gemini-1.5-flash",
+            "gemini-2.0-flash-lite-001",
+            "HuggingFaceH4/zephyr-7b-beta",
+            "google/gemma-7b",
+            "mistralai/Mistral-7B-Instruct-v0.3"
+        ]
+        selected_model = st.sidebar.selectbox("Choose model ↓", available_models, index=0)
 
-        # Display chat history
-        for i, message in enumerate(st.session_state["messages"]):
+        if ("llm" not in st.session_state) or (st.session_state.get("selected_model") != selected_model):
+            with st.spinner(f"Loading {selected_model}..."):
+                try:
+                    if "gemini" in selected_model.lower():
+                        st.session_state["llm"] = get_gemini_llm(selected_model)
+                    else:
+                        st.session_state["llm"] = get_hf_pipeline(selected_model)
+                    st.session_state["selected_model"] = selected_model
+                    st.success(f"{selected_model} loaded.")
+                except Exception as e:
+                    st.error(f"Failed: {e}")
+
+        st.subheader("💬 Chat")
+        active = st.session_state.get("active_chat")
+        if active is None:
+            st.info("Open or create a chat from the sidebar.")
+            return
+
+        messages = st.session_state["chats"][active].get("messages", [])
+        message_container = st.container()
+        for message in messages:
             avatar = "🤖" if message["role"] == "assistant" else "😎"
             with message_container.chat_message(message["role"], avatar=avatar):
                 st.markdown(message["content"])
 
-        # Chat input and processing
-        if prompt := st.chat_input("Enter a prompt here...", key="chat_input"):
-            try:
-                # Add user message to chat
-                st.session_state["messages"].append({"role": "user", "content": prompt})
-                with message_container.chat_message("user", avatar="😎"):
-                    st.markdown(prompt)
+        prompt = st.chat_input("Ask about the PDFs...")
+        if prompt:
+            msg_user = {"role": "user", "content": prompt, "ts": datetime.now().isoformat()}
+            st.session_state["chats"][active]["messages"].append(msg_user)
+            with message_container.chat_message("user", avatar="😎"):
+                st.markdown(prompt)
 
-                # Process and display assistant response
-                with message_container.chat_message("assistant", avatar="🤖"):
-                    with st.spinner(":green[processing...]"):
-                        if st.session_state["vector_db"] is not None:
-                            response = process_question(
-                                prompt, st.session_state["vector_db"], selected_model
-                            )
-                            st.markdown(response)
-                        else:
-                            st.warning("Please upload a PDF file first.")
+            with message_container.chat_message("assistant", avatar="🤖"):
+                with st.spinner("Thinking..."):
+                    vector_db = st.session_state["chats"][active].get("vector_db")
+                    llm = st.session_state.get("llm")
+                    try:
+                        response = process_question(prompt, vector_db, llm)
+                    except Exception as e:
+                        response = f"Error: {e}"
+                    st.markdown(response)
+                    msg_assistant = {"role": "assistant", "content": response, "ts": datetime.now().isoformat()}
+                    st.session_state["chats"][active]["messages"].append(msg_assistant)
 
-                # Add assistant response to chat history
-                if st.session_state["vector_db"] is not None:
-                    st.session_state["messages"].append(
-                        {"role": "assistant", "content": response}
-                    )
-
-            except Exception as e:
-                st.error(e, icon="⛔️")
-                logger.error(f"Error processing prompt: {e}")
-        else:
-            if st.session_state["vector_db"] is None:
-                st.warning("Upload a PDF file or use the sample PDF to begin chat...")
+            if active.startswith("Chat - "):
+                first_msg = prompt.strip()
+                short = (first_msg[:40] + "...") if len(first_msg) > 40 else first_msg
+                new_name = f"{short} — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                st.session_state["chats"][new_name] = st.session_state["chats"].pop(active)
+                st.session_state["active_chat"] = new_name
 
 
 if __name__ == "__main__":
