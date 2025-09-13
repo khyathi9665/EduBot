@@ -5,19 +5,42 @@ using HuggingFace + Gemini + LangChain.
 Adaptive professional UI (light/dark) with glassmorphism, premium SaaS feel.
 """
 
+import os
 import streamlit as st
 import logging
-import os
 import tempfile
 import shutil
 import pdfplumber
 import warnings
 from typing import List, Any, Optional
 from datetime import datetime
+from dotenv import load_dotenv
 
 # Suppress torch warnings
 warnings.filterwarnings("ignore", category=UserWarning, message=".torch.classes.")
 
+# ----------------- CONFIG -----------------
+MAX_PDFS = 5  # Maximum PDFs to upload per chat
+
+# 1️⃣ Streamlit page config must come first
+st.set_page_config(
+    page_title="📄 AI PDF Chat Assistant",
+    page_icon="🤖",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# 2️⃣ Load .env locally
+load_dotenv()
+
+# 3️⃣ Load Google API key (Streamlit Cloud: st.secrets, fallback to .env)
+GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY") or os.getenv("GOOGLE_API_KEY")
+if not GOOGLE_API_KEY:
+    st.error("❌ GOOGLE_API_KEY not found! Set it in .env (local) or Streamlit Secrets (cloud).")
+else:
+    st.sidebar.success("✅ GOOGLE_API_KEY loaded successfully")
+
+# ----------------- Imports for LangChain & HuggingFace -----------------
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
@@ -26,75 +49,17 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.llms import HuggingFacePipeline
+from langchain_google_genai import ChatGoogleGenerativeAI
 from transformers import pipeline, BitsAndBytesConfig
 import torch
 
-# Gemini
-from langchain_google_genai import ChatGoogleGenerativeAI
-from dotenv import load_dotenv
-
-load_dotenv()
-
-# Streamlit Cloud: use st.secrets, fallback to .env
-GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY") or os.getenv("GOOGLE_API_KEY")
-
-if not GOOGLE_API_KEY:
-    st.error("❌ GOOGLE_API_KEY not found! Set it in .env (local) or Streamlit Secrets (cloud).")
-
-# ----------------- CONFIG -----------------
-PERSIST_DIRECTORY = os.path.join("data", "vectors")
-MAX_PDFS = 5  # Maximum PDFs to upload per chat
-
-st.set_page_config(
-    page_title="📄 AI PDF Chat Assistant",
-    page_icon="🤖",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-# Load .env file
-load_dotenv()
-
-# ✅ Debug check for API key
-if not os.getenv("GOOGLE_API_KEY"):
-    st.error("❌ GOOGLE_API_KEY not found in .env file!")
-else:
-    st.sidebar.success("✅ GOOGLE_API_KEY loaded from .env")
-
+# ----------------- Logging -----------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
-
-# ----------------- Dark/Light Theme Toggle -----------------
-theme = st.sidebar.radio("🌗 Theme", ["Light", "Dark"], index=0)
-
-if theme == "Dark":
-    st.markdown(
-        """
-        <style>
-        body, .stApp { background-color: #0E1117; color: #FAFAFA; }
-        .stButton>button, .stSelectbox, .stFileUploader, .stTextInput, .stSlider {
-            background-color: #262730; color: #FAFAFA; border-radius: 10px;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True
-    )
-else:
-    st.markdown(
-        """
-        <style>
-        body, .stApp { background-color: #FFFFFF; color: #000000; }
-        .stButton>button, .stSelectbox, .stFileUploader, .stTextInput, .stSlider {
-            background-color: #F0F2F6; color: #000000; border-radius: 10px;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True
-    )
 
 # ----------------- Utility Functions -----------------
 def create_vector_db(file_uploads: List[Any]) -> Chroma:
@@ -167,7 +132,6 @@ def get_gemini_llm(model_name: str = "gemini-1.5-pro"):
     """Return a Gemini LLM wrapped for LangChain"""
     if not GOOGLE_API_KEY:
         raise ValueError("❌ GOOGLE_API_KEY not found in environment variables")
-
     return ChatGoogleGenerativeAI(
         model=model_name,
         temperature=0.2,
@@ -183,8 +147,6 @@ def process_question(question: str, vector_db: Optional[Chroma], llm) -> str:
         return "🤔 No documents uploaded for this chat."
 
     results = vector_db.similarity_search_with_score(question, k=3)
-
-    # ✅ Strict check: if no context or weak matches, refuse
     if not results or all(not doc.page_content.strip() for doc, _ in results):
         return "I don’t know, it is not mentioned in the uploaded PDFs."
 
@@ -201,7 +163,6 @@ Question: {question}
 """
 
     prompt = ChatPromptTemplate.from_template(template)
-
     chain = (
         {"context": lambda _: context_texts, "question": RunnablePassthrough()}
         | prompt
@@ -217,7 +178,6 @@ Question: {question}
 
 @st.cache_data
 def extract_all_pages_as_images(file_uploads: List[Any]) -> List[Any]:
-    """Return list of dicts {image, source, page} for preview."""
     pdf_pages = []
     for file_upload in file_uploads:
         with pdfplumber.open(file_upload) as pdf:
@@ -231,13 +191,12 @@ def extract_all_pages_as_images(file_uploads: List[Any]) -> List[Any]:
 
 
 def delete_chat_data(chat_id: str) -> None:
-    """Delete a single chat's persisted artifacts (if any) from memory."""
     chat = st.session_state["chats"].get(chat_id)
     if not chat:
         return
     try:
         db = chat.get("vector_db")
-        if db is not None and hasattr(db, "_client"):
+        if db and hasattr(db, "_client"):
             db._client.reset()
     except Exception:
         pass
@@ -251,7 +210,6 @@ def main() -> None:
 
     col1, col2 = st.columns([1.5, 2])
 
-    # Initialize session state containers
     if "chats" not in st.session_state:
         st.session_state["chats"] = {}
     if "active_chat" not in st.session_state:
@@ -261,18 +219,16 @@ def main() -> None:
     if "llm" not in st.session_state:
         st.session_state["llm"] = None
 
-    # Sidebar Chat History
+    # ---------------- Sidebar Chat History ----------------
     st.sidebar.subheader("💬 Chats")
     if st.sidebar.button("➕ New Chat"):
         chat_id = "Chat - " + datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        st.session_state["chats"][chat_id] = {
-            "messages": [], "vector_db": None, "file_uploads": [], "pdf_pages": []
-        }
+        st.session_state["chats"][chat_id] = {"messages": [], "vector_db": None, "file_uploads": [], "pdf_pages": []}
         st.session_state["active_chat"] = chat_id
 
     if st.session_state["chats"]:
         for chat_id in list(st.session_state["chats"].keys())[::-1]:
-            col_a, col_b = st.sidebar.columns([8,1])
+            col_a, col_b = st.sidebar.columns([8, 1])
             if col_a.button(chat_id, key=f"open_{chat_id}"):
                 st.session_state["active_chat"] = chat_id
             if col_b.button("🗑️", key=f"del_{chat_id}"):
@@ -281,7 +237,7 @@ def main() -> None:
                     st.session_state["active_chat"] = None
                 break
 
-    # Left: PDF upload
+    # ---------------- Left: PDF Upload ----------------
     with col1:
         st.subheader("📂 Documents & Collections")
         active = st.session_state.get("active_chat")
@@ -290,12 +246,7 @@ def main() -> None:
         else:
             st.markdown(f"**Active chat:** {active}")
 
-        file_uploads = st.file_uploader(
-            f"Upload PDF files (max {MAX_PDFS})",
-            type="pdf",
-            accept_multiple_files=True,
-            key=f"uploader_{active}"
-        )
+        file_uploads = st.file_uploader(f"Upload PDF files (max {MAX_PDFS})", type="pdf", accept_multiple_files=True, key=f"uploader_{active}")
 
         if file_uploads and active:
             if len(file_uploads) > MAX_PDFS:
@@ -331,7 +282,7 @@ def main() -> None:
             except Exception as e:
                 st.error(f"Failed: {e}")
 
-    # Right: Chat
+    # ---------------- Right: Chat ----------------
     with col2:
         st.sidebar.markdown("---")
         st.sidebar.subheader("🧠 Model")
@@ -389,6 +340,7 @@ def main() -> None:
                     msg_assistant = {"role": "assistant", "content": response, "ts": datetime.now().isoformat()}
                     st.session_state["chats"][active]["messages"].append(msg_assistant)
 
+            # Rename chat if default
             if active.startswith("Chat - "):
                 first_msg = prompt.strip()
                 short = (first_msg[:40] + "...") if len(first_msg) > 40 else first_msg
