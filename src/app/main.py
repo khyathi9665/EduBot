@@ -4,8 +4,8 @@ using HuggingFace + Gemini + LangChain.
 
 ✅ FAISS-based vector DB
 ✅ Multiple PDFs (cumulative)
-✅ PDF preview with zoom
 ✅ Sidebar + 2-column UI
+✅ PDF preview & chat history
 """
 
 import os
@@ -64,7 +64,7 @@ logger = logging.getLogger(__name__)
 
 # ----------------- Utility Functions -----------------
 def create_vector_db(file_uploads: List[Any]) -> FAISS:
-    """Create FAISS vector store from uploaded PDFs."""
+    """Create FAISS vector store from uploaded PDFs cumulatively."""
     all_chunks = []
 
     for file_upload in file_uploads:
@@ -169,7 +169,6 @@ Question: {question}
         return f"⚠️ Error: {e}"
 
 
-@st.cache_data
 def extract_all_pages_as_images(file_uploads: List[Any]) -> List[Any]:
     """Return list of dicts {image, source, page} for preview."""
     pdf_pages = []
@@ -204,16 +203,14 @@ def main() -> None:
     st.sidebar.subheader("💬 Chats")
     if st.sidebar.button("➕ New Chat"):
         chat_id = "Chat - " + datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        st.session_state["chats"][chat_id] = {
-            "messages": [], "vector_db": None, "file_uploads": [], "pdf_pages": []
-        }
+        st.session_state["chats"][chat_id] = {"messages": [], "vector_db": None, "file_uploads": [], "pdf_pages": []}
         st.session_state["active_chat"] = chat_id
 
     for chat_id in list(st.session_state["chats"].keys())[::-1]:
         col_a, col_b = st.sidebar.columns([8, 1])
-        if col_a.button(chat_id, key=f"open_{chat_id}"):
+        if col_a.button(chat_id, key=f"open_{chat_id}") and chat_id in st.session_state["chats"]:
             st.session_state["active_chat"] = chat_id
-        if col_b.button("🗑️", key=f"del_{chat_id}"):
+        if col_b.button("🗑️", key=f"del_{chat_id}") and chat_id in st.session_state["chats"]:
             st.session_state["chats"].pop(chat_id, None)
             if st.session_state.get("active_chat") == chat_id:
                 st.session_state["active_chat"] = None
@@ -237,22 +234,22 @@ def main() -> None:
 
         if file_uploads and active:
             existing_uploads = st.session_state["chats"][active].get("file_uploads", [])
-            all_uploads = existing_uploads + file_uploads
+            new_uploads = [f for f in file_uploads if f.name not in [e.name for e in existing_uploads]]
+            all_uploads = existing_uploads + new_uploads
             if len(all_uploads) > MAX_PDFS:
                 st.warning(f"Max {MAX_PDFS} PDFs allowed. Extras ignored.")
                 all_uploads = all_uploads[:MAX_PDFS]
 
             st.session_state["chats"][active]["file_uploads"] = all_uploads
-            with st.spinner("Processing PDFs..."):
+            with st.spinner("Processing all PDFs..."):
                 try:
                     vector_db = create_vector_db(all_uploads)
                     st.session_state["chats"][active]["vector_db"] = vector_db
                     st.session_state["chats"][active]["pdf_pages"] = extract_all_pages_as_images(all_uploads)
-                    st.success("✅ PDFs processed.")
+                    st.success(f"✅ Processed {len(all_uploads)} PDFs.")
                 except Exception as e:
                     st.error(f"Error: {e}")
 
-        # PDF Preview with zoom
         if active and st.session_state["chats"][active].get("pdf_pages"):
             with st.expander("📑 View PDFs"):
                 zoom = st.slider("Zoom", 100, 1000, 700, 50, key=f"zoom_{active}")
