@@ -63,8 +63,16 @@ logger = logging.getLogger(__name__)
 
 # ----------------- Utility Functions -----------------
 def create_vector_db(file_uploads: List[Any]) -> Chroma:
-    """Create vector database with HuggingFace embeddings (384-dim)."""
+    """Create vector DB using HuggingFace embeddings and DuckDB+Parquet (avoids SQLite)."""
+    import tempfile, shutil
+    from datetime import datetime
+    from langchain_community.vectorstores import Chroma
+    from langchain_community.embeddings import HuggingFaceEmbeddings
+    from langchain_community.document_loaders import PyPDFLoader
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+
     all_chunks = []
+
     for file_upload in file_uploads:
         temp_dir = tempfile.mkdtemp()
         path = os.path.join(temp_dir, file_upload.name)
@@ -73,8 +81,6 @@ def create_vector_db(file_uploads: List[Any]) -> Chroma:
 
         loader = PyPDFLoader(path)
         docs = loader.load()
-
-        # Track metadata
         for i, doc in enumerate(docs):
             doc.metadata["source"] = file_upload.name
             doc.metadata["page"] = i + 1
@@ -93,13 +99,15 @@ def create_vector_db(file_uploads: List[Any]) -> Chroma:
         model_kwargs={"device": "cpu"}
     )
 
-    persist_dir= "tmp/chroma_vectors"
+    # Use a temporary directory to avoid Streamlit Cloud SQLite issues
+    persist_dir = tempfile.mkdtemp()
+
     vector_db = Chroma.from_documents(
         documents=all_chunks,
         embedding=embeddings,
         persist_directory=persist_dir,
         collection_name=f"pdf_collection_{datetime.now().timestamp()}",
-        client_settings={"chroma_db_impl": "duckdb+parquet"}
+        client_settings={"chroma_db_impl": "duckdb+parquet"}  # <-- force DuckDB
     )
     return vector_db
 
