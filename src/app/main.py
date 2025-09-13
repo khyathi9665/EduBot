@@ -2,7 +2,7 @@
 Streamlit application for PDF-based Retrieval-Augmented Generation (RAG) 
 using HuggingFace + Gemini + LangChain.
 
-Adaptive professional UI (light/dark) with glassmorphism, premium SaaS feel.
+Fully DuckDB-based Chroma to avoid SQLite issues.
 """
 
 import os
@@ -22,7 +22,7 @@ warnings.filterwarnings("ignore", category=UserWarning, message=".torch.classes.
 # ----------------- CONFIG -----------------
 MAX_PDFS = 5  # Maximum PDFs to upload per chat
 
-# 1️⃣ Streamlit page config must come first
+# ----------------- Streamlit Config -----------------
 st.set_page_config(
     page_title="📄 AI PDF Chat Assistant",
     page_icon="🤖",
@@ -30,10 +30,8 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# 2️⃣ Load .env locally
+# ----------------- Load Environment -----------------
 load_dotenv()
-
-# 3️⃣ Load Google API key (Streamlit Cloud: st.secrets, fallback to .env)
 GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY") or os.getenv("GOOGLE_API_KEY")
 if not GOOGLE_API_KEY:
     st.error("❌ GOOGLE_API_KEY not found! Set it in .env (local) or Streamlit Secrets (cloud).")
@@ -50,6 +48,7 @@ from langchain_core.runnables import RunnablePassthrough
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.llms import HuggingFacePipeline
 from langchain_google_genai import ChatGoogleGenerativeAI
+from chromadb.config import Settings
 from transformers import pipeline, BitsAndBytesConfig
 import torch
 
@@ -63,7 +62,7 @@ logger = logging.getLogger(__name__)
 
 # ----------------- Utility Functions -----------------
 def create_vector_db(file_uploads: List[Any]) -> Chroma:
-    """Create vector DB using HuggingFace embeddings and DuckDB+Parquet (fully in-memory)."""
+    """Create vector DB using HuggingFace embeddings and DuckDB+Parquet only."""
     all_chunks = []
 
     for file_upload in file_uploads:
@@ -92,15 +91,19 @@ def create_vector_db(file_uploads: List[Any]) -> Chroma:
         model_kwargs={"device": "cpu"}
     )
 
-    # ------------------------ 🔑 FIX ------------------------
+    # Force DuckDB+Parquet, in-memory (avoids SQLite)
+    settings = Settings(
+        chroma_db_impl="duckdb+parquet",
+        persist_directory=None,
+        anonymized_telemetry=False
+    )
+
     vector_db = Chroma.from_documents(
         documents=all_chunks,
         embedding=embeddings,
-        persist_directory=None,  # do NOT persist to avoid SQLite
         collection_name=f"pdf_collection_{datetime.now().timestamp()}",
-        client_settings={"chroma_db_impl": "duckdb+parquet"}  # force DuckDB+Parquet
+        client_settings=settings
     )
-    # ---------------------------------------------------------
     return vector_db
 
 
