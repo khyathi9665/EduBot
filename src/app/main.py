@@ -96,12 +96,11 @@ def create_vector_db(file_uploads: List[Any]) -> Chroma:
         model_kwargs={"device": "cpu"}
     )
 
-    persist_dir = tempfile.mkdtemp()
 
     vector_db = Chroma.from_documents(
         documents=all_chunks,
         embedding=embeddings,
-        persist_directory=persist_dir,
+        persist_directory=None,
         collection_name=f"pdf_collection_{datetime.now().timestamp()}",
         client_settings={"chroma_db_impl": "duckdb+parquet"}  # force DuckDB
     )
