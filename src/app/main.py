@@ -2,8 +2,10 @@
 Streamlit application for PDF-based Retrieval-Augmented Generation (RAG) 
 using HuggingFace + Gemini + LangChain.
 
-✅ Uses FAISS instead of SQLite/Chroma.
-✅ Fixed: Properly wraps text into `Document` objects.
+✅ FAISS-based vector DB
+✅ Multiple PDFs (cumulative)
+✅ PDF preview with zoom
+✅ Sidebar + 2-column UI
 """
 
 import os
@@ -21,7 +23,7 @@ from dotenv import load_dotenv
 warnings.filterwarnings("ignore", category=UserWarning)
 
 # ----------------- Config -----------------
-MAX_PDFS = 5  # Maximum PDFs per chat
+MAX_PDFS = 5
 
 # 1️⃣ Streamlit page config
 st.set_page_config(
@@ -48,7 +50,7 @@ from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.llms import HuggingFacePipeline
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_community.vectorstores import FAISS
-from langchain.schema import Document   # ✅ FIX: use Document class
+from langchain.schema import Document
 from transformers import pipeline, BitsAndBytesConfig
 import torch
 
@@ -76,7 +78,6 @@ def create_vector_db(file_uploads: List[Any]) -> FAISS:
                 text = page.extract_text()
                 if not text:
                     continue
-                # ✅ Wrap as Document instead of dict
                 doc = Document(
                     page_content=text,
                     metadata={"source": file_upload.name, "page": i + 1}
@@ -168,6 +169,21 @@ Question: {question}
         return f"⚠️ Error: {e}"
 
 
+@st.cache_data
+def extract_all_pages_as_images(file_uploads: List[Any]) -> List[Any]:
+    """Return list of dicts {image, source, page} for preview."""
+    pdf_pages = []
+    for file_upload in file_uploads:
+        with pdfplumber.open(file_upload) as pdf:
+            for i, page in enumerate(pdf.pages):
+                pdf_pages.append({
+                    "image": page.to_image().original,
+                    "source": file_upload.name,
+                    "page": i + 1
+                })
+    return pdf_pages
+
+
 # ----------------- Main App -----------------
 def main() -> None:
     st.markdown("# 📄 AI PDF Chat Assistant")
@@ -188,14 +204,16 @@ def main() -> None:
     st.sidebar.subheader("💬 Chats")
     if st.sidebar.button("➕ New Chat"):
         chat_id = "Chat - " + datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        st.session_state["chats"][chat_id] = {"messages": [], "vector_db": None}
+        st.session_state["chats"][chat_id] = {
+            "messages": [], "vector_db": None, "file_uploads": [], "pdf_pages": []
+        }
         st.session_state["active_chat"] = chat_id
 
     for chat_id in list(st.session_state["chats"].keys())[::-1]:
         col_a, col_b = st.sidebar.columns([8, 1])
-        if col_a.button(chat_id, key=f"open_{chat_id}") and chat_id in st.session_state["chats"]:
+        if col_a.button(chat_id, key=f"open_{chat_id}"):
             st.session_state["active_chat"] = chat_id
-        if col_b.button("🗑️", key=f"del_{chat_id}") and chat_id in st.session_state["chats"]:
+        if col_b.button("🗑️", key=f"del_{chat_id}"):
             st.session_state["chats"].pop(chat_id, None)
             if st.session_state.get("active_chat") == chat_id:
                 st.session_state["active_chat"] = None
@@ -218,22 +236,34 @@ def main() -> None:
         )
 
         if file_uploads and active:
-            if len(file_uploads) > MAX_PDFS:
+            existing_uploads = st.session_state["chats"][active].get("file_uploads", [])
+            all_uploads = existing_uploads + file_uploads
+            if len(all_uploads) > MAX_PDFS:
                 st.warning(f"Max {MAX_PDFS} PDFs allowed. Extras ignored.")
-                file_uploads = file_uploads[:MAX_PDFS]
+                all_uploads = all_uploads[:MAX_PDFS]
 
-            st.session_state["chats"][active]["file_uploads"] = file_uploads
+            st.session_state["chats"][active]["file_uploads"] = all_uploads
             with st.spinner("Processing PDFs..."):
                 try:
-                    vector_db = create_vector_db(file_uploads)
+                    vector_db = create_vector_db(all_uploads)
                     st.session_state["chats"][active]["vector_db"] = vector_db
+                    st.session_state["chats"][active]["pdf_pages"] = extract_all_pages_as_images(all_uploads)
                     st.success("✅ PDFs processed.")
                 except Exception as e:
                     st.error(f"Error: {e}")
 
+        # PDF Preview with zoom
+        if active and st.session_state["chats"][active].get("pdf_pages"):
+            with st.expander("📑 View PDFs"):
+                zoom = st.slider("Zoom", 100, 1000, 700, 50, key=f"zoom_{active}")
+                for page_info in st.session_state["chats"][active]["pdf_pages"]:
+                    st.image(page_info["image"], width=zoom)
+                    st.caption(f'{page_info["source"]} - Page {page_info["page"]}')
+
         if active and st.button("⚠️ Clear PDFs for this chat"):
             st.session_state["chats"][active]["vector_db"] = None
             st.session_state["chats"][active]["file_uploads"] = []
+            st.session_state["chats"][active]["pdf_pages"] = []
             st.success("Cleared.")
 
     # ---------------- Right Column ----------------
@@ -263,7 +293,6 @@ def main() -> None:
                     st.error(f"Failed: {e}")
 
         st.subheader("💬 Chat")
-        active = st.session_state.get("active_chat")
         if active is None:
             st.info("Open or create a chat from the sidebar.")
             return
