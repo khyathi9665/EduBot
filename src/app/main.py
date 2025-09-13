@@ -2,8 +2,8 @@
 Streamlit application for PDF-based Retrieval-Augmented Generation (RAG) 
 using HuggingFace + Gemini + LangChain.
 
-✅ Uses FAISS vector store (avoids SQLite/Chroma issues)
-✅ Works locally and on Streamlit Cloud
+✅ Uses FAISS instead of SQLite/Chroma.
+✅ Fixed: Properly wraps text into `Document` objects.
 """
 
 import os
@@ -23,7 +23,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 # ----------------- Config -----------------
 MAX_PDFS = 5  # Maximum PDFs per chat
 
-# Streamlit page config
+# 1️⃣ Streamlit page config
 st.set_page_config(
     page_title="📄 AI PDF Chat Assistant",
     page_icon="🤖",
@@ -31,7 +31,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ----------------- Load .env -----------------
+# 2️⃣ Load .env
 load_dotenv()
 GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY") or os.getenv("GOOGLE_API_KEY")
 if not GOOGLE_API_KEY:
@@ -48,6 +48,7 @@ from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.llms import HuggingFacePipeline
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_community.vectorstores import FAISS
+from langchain.schema import Document   # ✅ FIX: use Document class
 from transformers import pipeline, BitsAndBytesConfig
 import torch
 
@@ -75,16 +76,20 @@ def create_vector_db(file_uploads: List[Any]) -> FAISS:
                 text = page.extract_text()
                 if not text:
                     continue
-                doc = {"page_content": text, "metadata": {"source": file_upload.name, "page": i + 1}}
+                # ✅ Wrap as Document instead of dict
+                doc = Document(
+                    page_content=text,
+                    metadata={"source": file_upload.name, "page": i + 1}
+                )
                 splitter = RecursiveCharacterTextSplitter(chunk_size=2500, chunk_overlap=200)
-                chunks = splitter.create_documents([doc])
+                chunks = splitter.split_documents([doc])
                 all_chunks.extend(chunks)
 
         shutil.rmtree(temp_dir)
 
     embeddings = HuggingFaceEmbeddings(
         model_name="sentence-transformers/all-MiniLM-L6-v2",
-        model_kwargs={"device": "cpu"}  # Cloud-friendly (no GPU requirement)
+        model_kwargs={"device": "cpu"}
     )
 
     vector_db = FAISS.from_documents(all_chunks, embeddings)
