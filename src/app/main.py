@@ -2,7 +2,8 @@
 Streamlit application for PDF-based Retrieval-Augmented Generation (RAG) 
 using HuggingFace + Gemini + LangChain.
 
-✅ Fully avoids SQLite/Chroma by using FAISS vector store.
+✅ Uses FAISS vector store (avoids SQLite/Chroma issues)
+✅ Works locally and on Streamlit Cloud
 """
 
 import os
@@ -22,7 +23,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 # ----------------- Config -----------------
 MAX_PDFS = 5  # Maximum PDFs per chat
 
-# 1️⃣ Streamlit page config
+# Streamlit page config
 st.set_page_config(
     page_title="📄 AI PDF Chat Assistant",
     page_icon="🤖",
@@ -30,7 +31,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# 2️⃣ Load .env
+# ----------------- Load .env -----------------
 load_dotenv()
 GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY") or os.getenv("GOOGLE_API_KEY")
 if not GOOGLE_API_KEY:
@@ -83,7 +84,7 @@ def create_vector_db(file_uploads: List[Any]) -> FAISS:
 
     embeddings = HuggingFaceEmbeddings(
         model_name="sentence-transformers/all-MiniLM-L6-v2",
-        model_kwargs={"device": "cpu"}
+        model_kwargs={"device": "cpu"}  # Cloud-friendly (no GPU requirement)
     )
 
     vector_db = FAISS.from_documents(all_chunks, embeddings)
@@ -189,7 +190,7 @@ def main() -> None:
         col_a, col_b = st.sidebar.columns([8, 1])
         if col_a.button(chat_id, key=f"open_{chat_id}") and chat_id in st.session_state["chats"]:
             st.session_state["active_chat"] = chat_id
-        if col_b.button("🗑️", key=f"del_{chat_id}"):
+        if col_b.button("🗑️", key=f"del_{chat_id}") and chat_id in st.session_state["chats"]:
             st.session_state["chats"].pop(chat_id, None)
             if st.session_state.get("active_chat") == chat_id:
                 st.session_state["active_chat"] = None
@@ -204,7 +205,12 @@ def main() -> None:
         else:
             st.markdown(f"**Active chat:** {active}")
 
-        file_uploads = st.file_uploader(f"Upload PDF files (max {MAX_PDFS})", type="pdf", accept_multiple_files=True, key=f"uploader_{active}")
+        file_uploads = st.file_uploader(
+            f"Upload PDF files (max {MAX_PDFS})",
+            type="pdf",
+            accept_multiple_files=True,
+            key=f"uploader_{active}"
+        )
 
         if file_uploads and active:
             if len(file_uploads) > MAX_PDFS:
