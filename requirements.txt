@@ -19,3 +19,8 @@ coverage==7.4.0
 pydantic==2.10.4
 pysqlite3-binary
 faiss-cpu
+sentence-transformers
+torch
+transformers
+python-dotenv
+langchain-google-genai
